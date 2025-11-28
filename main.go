@@ -1,23 +1,56 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"time"
 )
 
+// Route 定义了请求路径到目标地址的映射关系
 type Route struct {
-	Path   string
-	Target string
+	Path   string // 请求路径，如 /api/baidu
+	Target string // 目标服务地址，如 https://www.baidu.com
 }
 
+// ResponseWriterWrapper 包装 http.ResponseWriter 以捕获状态码
+type ResponseWriterWrapper struct {
+	http.ResponseWriter
+	StatusCode int // 响应的状态码
+}
+
+// WriteHeader 实现 http.ResponseWriter 接口，并记录状态码
+func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
+	w.StatusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+// Middleware 是中间件类型定义，用于包装 HTTP 处理函数
+type Middleware func(handlerFunc http.HandlerFunc) http.HandlerFunc
+
+// main 函数是程序入口点，初始化路由、中间件并启动 HTTP 服务器
 func main() {
+	// 初始化路由配置
 	routes := []Route{
 		{Path: "/api/baidu", Target: "https://www.baidu.com"},
 		{Path: "/api/github", Target: "https://api.github.com"},
-		{Path: "/api/local", Target: "http://localhost:8081"}, // 可对接你之前写的文件服务器
+		{Path: "/api/slow", Target: "https://httpbin.org/delay/10"},
 	}
-	http.HandleFunc("/", proxyHandler(routes))
+
+	// 初始化中间件链
+	middlewares := []Middleware{
+		CORSAMiddleware(),
+		TimeoutMiddleware(3 * time.Second),
+		LogMiddleware(),
+	}
+
+	// 构建处理函数并注册到根路径
+	handler := ChainMiddleware(proxyHandler(routes), middlewares...)
+	http.HandleFunc("/", handler)
+
+	// 启动 HTTP 服务器监听在端口 8082 上
 	err := http.ListenAndServe(":8082", nil)
 	if err != nil {
 		fmt.Println("Error starting server:", err)
@@ -25,30 +58,153 @@ func main() {
 	}
 }
 
+// LogMiddleware 返回一个日志记录中间件，用于记录请求方法、路径、响应状态码及耗时
+//
+// 参数:
+//   - next: 下一个处理函数
+//
+// 返回值:
+//   - http.HandlerFunc: 包含日志功能的处理函数
+func LogMiddleware() Middleware {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			method := r.Method
+			path := r.URL.Path
+
+			// 使用包装器来获取响应状态码
+			wrappedWriter := &ResponseWriterWrapper{
+				ResponseWriter: w,
+			}
+
+			next(w, r)
+
+			// 计算请求耗时（毫秒）
+			cost := time.Since(start).Seconds() * 1000
+			log.Printf("[%s] %s | 状态码：%d | 耗时：%.2fs", method, path, wrappedWriter.StatusCode, cost)
+		}
+	}
+}
+
+// TimeoutMiddleware 返回一个超时控制中间件，在指定时间内未完成请求则返回超时错误
+//
+// 参数:
+//   - timeout: 超时持续时间
+//
+// 返回值:
+//   - Middleware: 包含超时控制逻辑的中间件
+func TimeoutMiddleware(timeout time.Duration) Middleware {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			// 创建带超时的上下文
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			// 将新上下文附加到请求中
+			r = r.WithContext(ctx)
+
+			// 创建通道用于通知请求是否已完成
+			done := make(chan struct{})
+
+			// 在 goroutine 中执行下一个处理器
+			go func() {
+				next(w, r)
+				close(done)
+			}()
+
+			// 等待请求完成或超时
+			select {
+			case <-done:
+				// 正常结束
+			case <-ctx.Done():
+				// 超时处理
+				http.Error(w, "Request timeout", http.StatusGatewayTimeout)
+				log.Printf("[超时] %s %s | 超时时间：%.2f", r.Method, r.URL.Path, timeout.Seconds()*1000)
+			}
+		}
+	}
+}
+
+// CORSAMiddleware 返回一个跨域资源共享(CORS)支持的中间件
+//
+// 参数:
+//   - next: 下一个处理函数
+//
+// 返回值:
+//   - http.HandlerFunc: 支持 CORS 的处理函数
+func CORSAMiddleware() Middleware {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			// 设置允许所有来源访问
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			// 允许常用的 HTTP 方法
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			// 允许常见的头部字段
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+			// 对于预检请求直接返回成功状态
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+
+			next(w, r)
+		}
+	}
+}
+
+// ChainMiddleware 按照从右到左的顺序组合多个中间件形成调用链
+//
+// 参数:
+//   - handler: 最终要被调用的处理函数
+//   - middlewares: 中间件列表
+//
+// 返回值:
+//   - http.HandlerFunc: 经过中间件层层包裹后的最终处理函数
+func ChainMiddleware(handler http.HandlerFunc, middlewares ...Middleware) http.HandlerFunc {
+	// 逆序应用中间件，确保最左边的中间件最先执行
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		handler = middlewares[i](handler)
+	}
+	return handler
+}
+
+// proxyHandler 根据请求路径将请求代理转发至对应的目标地址
+//
+// 参数:
+//   - routes: 路由规则数组，包含源路径与目标地址的映射
+//
+// 返回值:
+//   - http.HandlerFunc: 反向代理处理函数
 func proxyHandler(routes []Route) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var target string
+		// 查找匹配的路由规则
 		for _, route := range routes {
 			if route.Path == r.URL.Path {
 				target = route.Target
 			}
 		}
 
+		// 若没有找到对应的路由规则，则返回 404 错误
 		if target == "" {
 			http.Error(w, "404 Route Not Found", http.StatusNotFound)
 			return
 		}
 
-		req, err := http.NewRequest(r.Method, target, r.Body)
+		// 构造新的请求对象，携带原始请求的方法、URL 和 Body
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
 		if err != nil {
 			http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
 			return
 		}
 
+		// 复制原请求的所有 Header 到新请求中
 		for k, v := range r.Header {
 			req.Header[k] = v
 		}
 
+		// 发起请求并将结果回传给客户端
 		client := http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
@@ -57,11 +213,15 @@ func proxyHandler(routes []Route) http.HandlerFunc {
 		}
 		defer resp.Body.Close()
 
+		// 回写响应头信息
 		for k, v := range resp.Header {
 			w.Header()[k] = v
 		}
 
+		// 写入响应状态码
 		w.WriteHeader(resp.StatusCode)
+
+		// 将远程响应体复制到当前响应流中
 		_, err = io.Copy(w, resp.Body)
 		if err != nil {
 			http.Error(w, "Failed to copy response body", http.StatusBadGateway)

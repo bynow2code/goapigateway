@@ -13,6 +13,7 @@ import (
 type Route struct {
 	Path   string // 请求路径，如 /api/baidu
 	Target string // 目标服务地址，如 https://www.baidu.com
+	QPS    int    // 每秒
 }
 
 // ResponseWriterWrapper 包装 http.ResponseWriter 以捕获状态码
@@ -34,13 +35,14 @@ type Middleware func(handlerFunc http.HandlerFunc) http.HandlerFunc
 func main() {
 	// 初始化路由配置
 	routes := []Route{
-		{Path: "/api/baidu", Target: "https://www.baidu.com"},
-		{Path: "/api/github", Target: "https://api.github.com"},
-		{Path: "/api/slow", Target: "https://httpbin.org/delay/10"},
+		{Path: "/api/baidu", Target: "https://www.baidu.com", QPS: 1},
+		{Path: "/api/github", Target: "https://api.github.com", QPS: 3},
+		{Path: "/api/slow", Target: "https://httpbin.org/delay/10", QPS: 1},
 	}
 
 	// 初始化中间件链
 	middlewares := []Middleware{
+		RateLimitMiddleware(routes),
 		CORSAMiddleware(),
 		TimeoutMiddleware(3 * time.Second),
 		LogMiddleware(),
@@ -50,6 +52,7 @@ func main() {
 	handler := ChainMiddleware(proxyHandler(routes), middlewares...)
 	http.HandleFunc("/", handler)
 
+	fmt.Println("服务已启动:8082")
 	// 启动 HTTP 服务器监听在端口 8082 上
 	err := http.ListenAndServe(":8082", nil)
 	if err != nil {

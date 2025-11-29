@@ -64,21 +64,23 @@ func (tb *TokenBucket) Allow() bool {
 	return false
 }
 
-// 全局默认限流器：容量为1，速率为1 QPS
-var globalLimiter = NewTokenBucket(1, 1)
-
 // RateLimitMiddleware 是一个中间件工厂函数，根据路由配置应用不同的限流策略。
-// 参数 routes 包含各个路径对应的 QPS 配置信息。
+// 参数 config 包含全局及各路径对应的 QPS 配置信息。
 // 返回一个包装后的 http.HandlerFunc 处理器。
-func RateLimitMiddleware(rotes []Route) Middleware {
+func RateLimitMiddleware(config *Config) Middleware {
+	routes := config.Routes
+
 	// 提前给路由构建好各自的限流器
 	routeLimiters := make(map[string]*TokenBucket)
-	for _, route := range rotes {
+	for _, route := range routes {
 		if route.QPS > 0 {
 			routeLimiters[route.Path] = NewTokenBucket(route.QPS*2, route.QPS)
 			break
 		}
 	}
+
+	// 提前初始化全局限流器
+	globalLimiter := NewTokenBucket(config.GlobalRateLimit.Cap, config.GlobalRateLimit.Rate)
 
 	// 返回实际的中间件处理逻辑
 	return func(next http.HandlerFunc) http.HandlerFunc {

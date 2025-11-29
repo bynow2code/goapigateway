@@ -1,0 +1,29 @@
+port: ":8082"
+
+apiKeys:
+  - "gw-123456"
+  - "gw-123789"
+
+noAuthRoutes:
+  - "/api/public"
+
+routes:
+  - path: "/api/baidu"
+    target: "https://www.baidu.com"
+    qps: 5
+  - path: "/api/github"
+    target: "https://api.github.com"
+    qps: 3
+  - path: "/api/slow"
+    target: "https://httpbin.org/delay/10"
+    qps: 2
+  - path: "/api/public"
+    target: "https://httpbin.org/get"
+    qps: 10
+
+globalRateLimit:
+  cap: 20
+  rate: 10
+
+
+timeout: 3s

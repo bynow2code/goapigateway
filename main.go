@@ -9,13 +9,6 @@ import (
 	"time"
 )
 
-// Route 定义了请求路径到目标地址的映射关系
-type Route struct {
-	Path   string // 请求路径，如 /api/baidu
-	Target string // 目标服务地址，如 https://www.baidu.com
-	QPS    int    // 每秒
-}
-
 // ResponseWriterWrapper 包装 http.ResponseWriter 以捕获状态码
 type ResponseWriterWrapper struct {
 	http.ResponseWriter
@@ -33,31 +26,69 @@ type Middleware func(handlerFunc http.HandlerFunc) http.HandlerFunc
 
 // main 函数是程序入口点，初始化路由、中间件并启动 HTTP 服务器
 func main() {
-	// 初始化路由配置
-	routes := []Route{
-		{Path: "/api/baidu", Target: "https://www.baidu.com", QPS: 1},
-		{Path: "/api/github", Target: "https://api.github.com", QPS: 3},
-		{Path: "/api/slow", Target: "https://httpbin.org/delay/10", QPS: 1},
+	config, err := loadConfig("config.yaml")
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
 	// 初始化中间件链
 	middlewares := []Middleware{
-		RateLimitMiddleware(routes),
+		AuthMiddleware(config),
+		RateLimitMiddleware(config),
 		CORSAMiddleware(),
 		TimeoutMiddleware(3 * time.Second),
 		LogMiddleware(),
 	}
 
 	// 构建处理函数并注册到根路径
-	handler := ChainMiddleware(proxyHandler(routes), middlewares...)
+	handler := ChainMiddleware(proxyHandler(config.Routes), middlewares...)
 	http.HandleFunc("/", handler)
 
-	fmt.Println("服务已启动:8082")
+	fmt.Printf("服务已启动：[%s]\n", config.Port)
+
 	// 启动 HTTP 服务器监听在端口 8082 上
-	err := http.ListenAndServe(":8082", nil)
+	err = http.ListenAndServe(config.Port, nil)
 	if err != nil {
 		fmt.Println("Error starting server:", err)
 		return
+	}
+}
+
+func AuthMiddleware(config *Config) Middleware {
+	apiKeysSet := make(map[string]struct{})
+	for _, v := range config.ApiKeys {
+		apiKeysSet[v] = struct{}{}
+	}
+
+	noAuthSet := make(map[string]struct{})
+	for _, v := range config.NoAuthRoutes {
+		noAuthSet[v] = struct{}{}
+	}
+
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if _, ok := noAuthSet[r.URL.Path]; ok {
+				next(w, r)
+				return
+			}
+
+			apiKey := r.Header.Get("X-API-Key")
+			if apiKey == "" {
+				w.Header().Set("WWW-Authenticate", "X-API-Key") // 提示客户端需要携带API Key
+				http.Error(w, "401 Unauthorized: Missing X-API-Key", http.StatusUnauthorized)
+				log.Printf("[认证失败] %s %s | 未携带API Key", r.Method, r.URL.Path)
+				return
+			}
+
+			if _, ok := apiKeysSet[apiKey]; ok {
+				log.Printf("[认证成功] %s %s | API Key: %s", r.Method, r.URL.Path, apiKey)
+				next(w, r)
+			} else {
+				http.Error(w, "401 Unauthorized: Invalid X-API-Key", http.StatusUnauthorized)
+				log.Printf("[认证失败] %s %s | 非法API Key: %s", r.Method, r.URL.Path, apiKey)
+				return
+			}
+		}
 	}
 }
 
@@ -179,7 +210,7 @@ func ChainMiddleware(handler http.HandlerFunc, middlewares ...Middleware) http.H
 //
 // 返回值:
 //   - http.HandlerFunc: 反向代理处理函数
-func proxyHandler(routes []Route) http.HandlerFunc {
+func proxyHandler(routes []RouteConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var target string
 		// 查找匹配的路由规则
